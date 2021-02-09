@@ -1,0 +1,761 @@
+---
+title: "Final project"
+author: "Candidate no. 453013"
+date: "2020/10/29"
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+options("scipen"=100, "digits"=4)
+
+library(skimr)
+library(dplyr)
+library(tidyr)
+library(ggcorrplot)
+library(ggplot2)
+library(rsample)
+library(recipes)
+library(parsnip)
+library(patchwork)
+library(DiagrammeR)
+library(xgboost)
+library(recipes)
+library(solitude)
+library(forcats)
+library(yardstick)
+library(gtsummary)
+library(tidymodels)
+library(vip)
+
+```
+
+# Assignment 1
+
+## 1) Familiarize with the data and visualize the data
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# read data
+df <- readRDS("flagged_customers.rds")
+
+# Explorative analysis
+skimr::skim(df)
+
+# data processing
+df2 <- df %>% 
+  mutate(operation_year=fiscal_year-year_started)%>%# how many years the company is in operation from started to observed
+  mutate(company_id = as.character(company_id))%>%
+  mutate(fiscal_year = as.character(fiscal_year))%>%
+  mutate(num_accounts = as.factor(num_accounts))%>%
+  mutate(company_size = as.factor(company_size))%>%
+  mutate(language_form = as.factor(language_form))%>%
+  mutate(organization_type = as.factor(organization_type))%>%
+  mutate(nace = as.factor(nace))%>%
+  mutate(risk_industry = as.factor(risk_industry))%>%
+  mutate(country_customer = as.factor(country_customer))%>%
+  mutate(year_started = as.character(year_started))%>%
+  mutate(municipal_customer = as.factor(municipal_customer))%>%  
+  drop_na(reported)%>%
+  drop_na(company_id)
+
+#skimr::skim(df2)
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# check the colinearity between independent variables
+df2 %>% 
+  select_if(is.numeric) %>% 
+  select(-reported) %>% 
+  cor() %>% 
+  ggcorrplot::ggcorrplot( ggtheme = "theme_classic",lab=TRUE,sig.level=TRUE)
+
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# The distribution of credit turnover in fiscal year in NOK
+df2 %>% 
+  ggplot(aes(x = log10(credit_turnover))) +
+  geom_density(fill = "seagreen4", color = "black") +
+  geom_vline(xintercept=log10(mean(df2$credit_turnover)), size=0.5, color="black")+
+  labs(title = "Distribution of credit turnover in fiscal year in NOK", 
+       subtitle = "With mean credit turnover as xintercept",
+       x = "The base 10 logarithm of Credit turnover",
+       y = "Customer numbers")
+
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# The distribution of number of accounts
+df2 %>% 
+  ggplot(aes(x = forcats::fct_infreq(num_accounts),fill = factor(reported))) +
+  geom_bar() +
+  labs(x = "Number of accounts ", 
+       y="Company numbers",
+       title = "The distribution of number of accounts ")
+
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# The distribution of risk class based on industry
+df2 %>% 
+  ggplot(aes(x = forcats::fct_infreq(risk_industry),fill = factor(reported))) +
+  geom_bar() +
+  labs(x = "Risk class based on industry", 
+       y="Company numbers",
+       title = "The distribution of risk class based on industry ")
+
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# The distribution of company size
+df2 %>% 
+  ggplot(aes(x = forcats::fct_infreq(company_size),fill = factor(reported))) +
+  geom_bar() +
+  labs(x = "Company size", 
+       y="Company numbers",
+       title = "The distribution of company size ",
+       subtitle = "Splitting up reported companies (blue) and not reported companies (red)")
+
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# The relationship between the probability of being reported and the size of the company
+df2 %>% 
+  group_by(company_size) %>% 
+  summarise(mean_reported = mean(reported)) %>% 
+  ggplot(aes(x = fct_reorder(company_size,-mean_reported), y = mean_reported)) +
+  geom_col() +
+  geom_label(aes(label = scales::percent(mean_reported)))+
+  labs(x = "The size of the company", 
+       y="The probability of being reported",
+       title = "The relationship between the probability of being reported and company size")
+```
+
+
+## 2) Create a logistic regression model
+
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# Variable selection and transformations
+df3 <- df2 %>% 
+  filter(operating_income > 0, # Negative number and zero can not take log transformation.
+         credit_turnover>0,
+         duration_customer_relationship>0,
+         operation_year>0)%>%
+  mutate(municipal_customer=fct_lump(municipal_customer, 4), 
+         log_operating_income=log10(operating_income), 
+         log_credit_turnover=log10(credit_turnover),
+         log_duration=log10(duration_customer_relationship),
+         log_operation_year=log10(operation_year))%>%
+  select(num_accounts,
+         company_size,
+         language_form,
+         risk_industry,
+         municipal_customer,
+         log_operating_income,
+         log_credit_turnover,
+         log_duration,
+         log_operation_year, 
+         reported)%>%
+  mutate(reported=as.factor(reported))%>%
+  na.omit()
+skimr::skim(df3)
+
+```
+
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+#Split data in training (75%) and testing (25%).
+set.seed(123)
+init_sample <- initial_split(df3, prop = 3/4, strata = reported)
+train <- training(init_sample)
+test <- testing(init_sample)
+
+rec <- recipe(reported ~ ., data = train) 
+
+trained_rec <- prep(rec, data = train)
+
+```
+
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+
+glm_model <- logistic_reg() %>% 
+  set_engine("glm") %>% 
+  fit(reported ~ ., data = train)
+
+# Add predictions to test
+test <- test %>%
+  mutate(glm_prob_predictions = predict(glm_model, new_data = test, type = "prob")$.pred_1,# For probabilities
+         glm_class_predictions =  predict(glm_model, new_data = test)$.pred_class)# The predicted class
+
+roc_glm <- test %>%
+  yardstick::roc_auc(reported, glm_prob_predictions, event_level = "second")%>%
+  mutate(tag = "glm on test")
+
+roc_glm
+
+```
+
+```{r}
+# Check results on training set
+train %>%
+  mutate(glm_prob_predictions = predict(glm_model, new_data = train, type = "prob")$.pred_1,
+         glm_class_predictions = predict(glm_model, new_data = train)$.pred_class) %>%
+  yardstick::roc_auc(reported, glm_prob_predictions, event_level = "second")%>%
+  mutate(tag = "glm on train")
+
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+test %>%
+  yardstick::roc_curve(reported, glm_prob_predictions, event_level = "second") %>% 
+  autoplot()
+```
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# The confusion matrix:
+test %>%
+  conf_mat(truth = reported, estimate = glm_class_predictions)
+```
+
+
+## 3) Explain the findings from your model. 
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# summary
+broom::tidy(glm_model$fit) %>% 
+  mutate_if(is.numeric, ~round(.x, 3)) %>% 
+  DT::datatable(rownames = FALSE)
+
+
+```
+
+
+## 4) Create a XGBoost model
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+df_xgb <- df2 %>%
+  select(-company_id,-debit_turnover) %>%
+  mutate(reported=as.factor(reported),
+         organization_type=as.factor(organization_type),
+         fiscal_year=as.factor(fiscal_year),
+         year_started=as.factor(year_started),
+         nace=as.factor(nace),
+         bankrupt=as.factor(bankrupt),
+         municipal_customer=as.factor(municipal_customer))%>%
+  mutate_if(is.character, factor) %>%
+  na.omit()
+skimr::skim(df_xgb)
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+#splitting the data into training and testing sets
+set.seed(123)
+xgb_split <- initial_split(df_xgb, strata = reported)
+xgb_train <- training(xgb_split)
+xgb_test <- testing(xgb_split)
+
+```
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+#create a model specification that identifies which hyperparameters we plan to tune
+xgb_spec <- boost_tree(
+  trees = 1000, 
+  tree_depth = tune(), min_n = tune(), 
+  loss_reduction = tune(),                     ## first three: model complexity
+  sample_size = tune(), mtry = tune(),         ## randomness
+  learn_rate = tune(),                         ## step size
+) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+xgb_spec
+
+
+```
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+#create a regular grid of values to try using some convenience functions for each hyperparameter
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), xgb_train),
+  learn_rate(),
+  size = 30)
+
+xgb_grid
+
+```
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# put the model specification into a workflow
+xgb_wf <- workflow() %>%
+  add_formula(reported ~ .) %>%
+  add_model(xgb_spec)
+
+xgb_wf
+
+```
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+#create cross-validation resamples for tuning the model
+set.seed(33)
+xgb_folds <- vfold_cv(xgb_train, strata = reported)
+
+xgb_folds
+
+```
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# tuning the model
+doParallel::registerDoParallel()
+
+set.seed(234)
+xgb_res <- tune_grid(
+  xgb_wf,
+  resamples = xgb_folds,
+  grid = xgb_grid,
+  control = control_grid(save_pred = TRUE)
+)
+
+xgb_res
+
+```
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+#explore the metrics for all these models
+collect_metrics(xgb_res)
+```
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+#use visualization to understand the results
+#the main take away from this plot is that there are several combinations of parameters that perform well.
+xgb_res %>%
+  collect_metrics() %>%
+  filter(.metric == "roc_auc") %>%
+  select(mean, mtry:sample_size) %>%
+  pivot_longer(mtry:sample_size,
+               values_to = "value",
+               names_to = "parameter"
+  ) %>%
+  ggplot(aes(value, mean, color = parameter)) +
+  geom_point(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~parameter, scales = "free_x") +
+  labs(x = NULL, y = "AUC")
+```
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# show top 5 candidate models by the metric of ROC AUC
+show_best(xgb_res, metric="roc_auc")
+```
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+#choose the model with best ROC AUC
+best_auc <- select_best(xgb_res, "roc_auc")
+best_auc
+```
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+#finalize the  workflow with these hyperparameter values, the tuning process is done.
+final_xgb <- finalize_workflow(
+  xgb_wf,
+  best_auc
+)
+
+# fit the model on the training data
+xgb_model <- fit(final_xgb, xgb_train)
+
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+#the most important parameters for variable importance
+xgb_model %>%
+  pull_workflow_fit() %>%
+  vip(geom = "point")
+```
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+
+# evaluate the model on the testing set
+xgb_test <- xgb_test %>%
+  mutate(xg_prob_predictions = predict(xgb_model, new_data = xgb_test, type = "prob")$.pred_1,
+         xg_class_predictions = predict(xgb_model, new_data = xgb_test)$.pred_class)
+
+roc_xg <- xgb_test %>%
+  yardstick::roc_auc(reported, xg_prob_predictions, event_level = "second")
+
+roc_xg %>%
+  mutate(tag = "xg") %>% 
+  bind_rows(roc_glm %>% mutate(tag = "glm")) %>% 
+  arrange(.estimate)
+
+# Check results on training set
+xgb_train %>%
+  mutate(xgb_prob_predictions = predict(xgb_model, new_data = xgb_train, type = "prob")$.pred_1,
+         xgb_class_predictions = predict(xgb_model, new_data = xgb_train)$.pred_class) %>%
+  yardstick::roc_auc(reported, xgb_prob_predictions, event_level = "second")%>%
+  mutate(tag = "xgb on train")
+
+
+```
+
+
+
+## 5) Evaluate the performance of your models using 10-fold cross validation. 
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+
+# evaluate the performance of glm model
+glm_model_cv <- logistic_reg() %>% 
+  set_engine("glm")
+
+glm_wflow <- workflow() %>% 
+  add_recipe(trained_rec) %>% 
+  add_model(glm_model_cv)
+
+
+keep_pred <- control_resamples(save_pred = TRUE)
+set.seed(33)
+df_folds <- rsample::vfold_cv(df3, v = 10)
+
+glm_cv_res <- glm_wflow %>% 
+  fit_resamples(resamples = df_folds, control = keep_pred)
+
+mean_roc <- collect_metrics(glm_cv_res) %>% 
+  filter(.metric == "roc_auc") %>% 
+  pull(mean)
+
+glm_cv_img<-collect_metrics(glm_cv_res, summarize = FALSE) %>%
+  filter(.metric == "roc_auc") %>% 
+  ggplot(aes(y = .estimate, x = id)) +
+  ylim(0.4,0.8)+
+  geom_point() +
+  geom_hline(yintercept = mean_roc, linetype = "dashed")+
+  labs(x="10-fold cross validation",
+       y="ROC AUC",
+       title = "Evaluate the performance of the linear logistic regression model",
+       subtitle = "With mean ROC AUC as yintercept")
+
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# evaluate the performance of xgboost model
+keep_pred <- control_resamples(save_pred = TRUE)
+set.seed(33)
+xgb_folds <- vfold_cv(xgb_train, strata = reported)
+
+xgb_cv_res <- final_xgb %>% 
+  fit_resamples(resamples = xgb_folds, control = keep_pred)
+
+xgb_mean_roc <- collect_metrics(xgb_cv_res) %>% 
+  filter(.metric == "roc_auc") %>% 
+  pull(mean)
+
+collect_metrics(xgb_cv_res) %>%
+  mutate(tag = "XGBoost")%>%
+  bind_rows(collect_metrics(glm_cv_res)%>%mutate(tag = "glm")) 
+
+# guess with the mean
+1-mean(na.omit(df$reported)) #0.7969
+
+
+xgb_cv_img<-collect_metrics(xgb_cv_res, summarize = FALSE) %>%
+  filter(.metric == "roc_auc") %>% 
+  ggplot(aes(y = .estimate, x = id)) +
+  ylim(0.4,0.8)+
+  geom_point() +
+  geom_hline(yintercept = xgb_mean_roc, linetype = "dashed")+
+  labs(x="10-fold cross validation",
+       y="ROC AUC",
+       title = "Evaluate the performance of the XGBoost model",
+       subtitle = "With mean ROC AUC as yintercept")
+
+glm_cv_img+xgb_cv_img
+
+```
+
+# Assignment 2
+
+## 1) Create an anomaly detection model
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+transaction_df <- readRDS("df_transactions.rds")
+skimr::skim(transaction_df)
+
+transaction_df2 <- transaction_df %>% 
+  mutate(transaction_type = as.factor(transaction_type))%>%  
+  mutate(receiver_country_id = as.factor(receiver_country_id))%>% 
+  mutate(receiver_bank_country_id = as.factor(receiver_bank_country_id))%>%
+  mutate(receiver_bank_id = as.factor(receiver_bank_id))%>%
+  mutate(from_account_id = as.factor(from_account_id))%>%
+  mutate(to_account_id = as.factor(to_account_id))%>%
+  mutate(transaction_id = as.character(transaction_id))%>%
+  mutate(company_id = as.factor(company_id))%>%
+  select(-to_account_id)%>%
+  na.omit()%>% 
+  distinct()# Remove duplicates
+
+#skimr::skim(transaction_df2)
+
+# add the operating_income variable from customer_df 
+transaction_df2 <-merge(transaction_df2 , df[, c("company_id", "operating_income")], by="company_id")%>% 
+  filter(operating_income>0,
+         abs(amount_NOK)>0)%>%
+  mutate(week_day = lubridate::wday(transcaction_date, label = TRUE),#add weekdays
+         month=lubridate::month(transcaction_date, label = TRUE),
+         day=lubridate::mday(transcaction_date),
+         relative_size=abs(amount_NOK)/operating_income,#relative size of a transaction to operating income
+         log_amount=log10(abs(amount_NOK)),
+         log_relative_size=log10(relative_size),
+         text_code = fct_lump(text_code, 20),
+         receiver_country_id = fct_lump(receiver_country_id, 20),
+         receiver_bank_country_id = fct_lump(receiver_bank_country_id, 20),
+         receiver_bank_id = fct_lump(receiver_bank_id, 20),
+         from_account_id = fct_lump(from_account_id, 20),
+         )%>%
+  na.omit()
+
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+
+# Select the variables we want in the model
+train2 <- transaction_df2 %>% 
+  mutate(day=as.factor(day))%>%
+  select(month,
+         day,
+         week_day,
+         log_amount,
+         log_relative_size,
+         currency,
+         transaction_type,
+         text_code,
+         overfoering_egne_konti,
+         receiver_country_id,
+         receiver_bank_country_id,
+         receiver_bank_id,
+         from_account_id)
+
+skim(train2)
+
+# Specify the forest parameters
+isf <- isolationForest$new(num_trees = 100, 
+                           sample_size = 1e5)
+# Train the model
+isf$fit(train2)
+```
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# Predict score
+transaction_df2$anomaly_score <- isf$predict(train2)$anomaly_score
+```
+
+## 2) Visualize some of the relationships
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+transaction_df2 %>% 
+  ggplot(aes(y = anomaly_score, x = log_amount,color=currency)) +
+  #geom_jitter(alpha = 0.3) +
+  geom_smooth()+
+  labs(x="The base 10 logarithm of transaction amount in NOK",
+       y="Anomaly score",
+       title = "The relationship between the anomaly score and transaction amount ",
+       subtitle = "Split in the currency of the transaction")
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+transaction_df2 %>% 
+  ggplot(aes(x = receiver_country_id, y = currency, fill = anomaly_score)) +
+  geom_tile() +
+  scale_fill_viridis_c()+
+  labs(x="Identifier for the country of the receiver",
+       y="Anomaly score",
+       title = "The relationship between the anomaly score and receiver's country ",
+       subtitle = "Split in the currency of the transaction")
+
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+transaction_df2 %>% 
+  ggplot(aes(x =fct_lump(receiver_bank_country_id, 10), y = currency, fill = anomaly_score)) +
+  geom_tile() +
+  scale_fill_viridis_c()+
+  labs(x="Identifier for the country of the receiving bank",
+       y="Anomaly score",
+       title = "The relationship between the anomaly score and receiving bank's country ",
+       subtitle = "Split in the currency of the transaction")
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+transaction_df2 %>% 
+  ggplot(aes(y = fct_reorder(receiver_country_id, anomaly_score), x = anomaly_score)) +
+  geom_boxplot(fill = "steelblue") +
+  labs(y = NULL)+
+  labs(x="Anomaly score",
+       y="Identifier for the country of the receiver",
+       title = "The relationship between the anomaly score and receiver's country ",
+       subtitle = "Sort by anomaly score")
+```
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+transaction_df2 %>% 
+  ggplot(aes(y = fct_reorder(currency, anomaly_score), x = anomaly_score)) +
+  geom_boxplot(fill = "steelblue") +
+  labs(y = NULL)+
+  labs(x="Anomaly score",
+       y="The currency of the transaction",
+       title = "The relationship between the anomaly score and currency ",
+       subtitle = "Sort by anomaly score")
+```
+
+
+## 3) Create an aggregation function
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+
+agg_anomaly_score <-transaction_df2 %>%
+    group_by(company_id) %>%
+    top_n(3, anomaly_score) %>%
+    summarise(top_anomaly_score = mean(anomaly_score))
+agg_anomaly_score <-agg_anomaly_score%>%
+    mutate(max_anomaly_score= aggregate(transaction_df2$anomaly_score, 
+                                      by=list(transaction_df2$company_id),FUN=max)[,2])
+
+agg_anomaly_score
+
+```
+
+## 4) Evaluate how well your anomaly detection model was able to separate actual reported cases from non-reported cases historically.
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+
+agg_anomaly_score <-  merge(agg_anomaly_score , df[, c("company_id", "reported")], by="company_id")
+
+agg_anomaly_score
+
+agg_anomaly_score %>% 
+  ggplot(aes(y = top_anomaly_score, x = factor(reported))) +
+  geom_point() +
+  geom_boxplot(alpha = 0.7) +
+  geom_violin(alpha = .3, fill = "steelblue", color = "gold") +
+  ylim(0.575,0.725)+
+  labs(title = "Performance of anomaly detection model", 
+       x = "Was the company reported to Økokrim?",
+       y = "Mean of the top 3 highest predicted anomaly scores")
+
+agg_anomaly_score %>% 
+  ggplot(aes(y = max_anomaly_score, x = factor(reported))) +
+  geom_point() +
+  geom_boxplot(alpha = 0.7) +
+  geom_violin(alpha = .3, fill = "steelblue", color = "gold") +
+  ylim(0.575,0.725)+
+  labs(title = "Performance of anomaly detection model", 
+       x = "Was the company reported to Økokrim?",
+       y = "The highest predicted anomaly score")
+
+
+```
+
+## 5) Explain why it might be beneficial in this case to use a combination of a supervised model (such as the one you created in Task 1) and an unsupervised model.
+
+```{r}
+# add the companies' maximum anomaly score to the customer data
+df_ano  <- df2 %>% merge(agg_anomaly_score[, c("company_id", "max_anomaly_score")], by="company_id") %>%
+    filter(operating_income > 0, 
+         credit_turnover>0,
+         duration_customer_relationship>0,
+         operation_year>0)%>%
+  mutate(municipal_customer=fct_lump(municipal_customer, 4), 
+         log_operating_income=log10(operating_income), 
+         log_credit_turnover=log10(credit_turnover),
+         log_duration=log10(duration_customer_relationship),
+         log_operation_year=log10(operation_year))%>%
+  select(num_accounts,
+         max_anomaly_score,
+         company_size,
+         language_form,
+         risk_industry,
+         municipal_customer,
+         log_operating_income,
+         log_credit_turnover,
+         log_duration,
+         log_operation_year, 
+         reported)%>%
+  mutate(reported=as.factor(reported))%>%
+  na.omit()
+
+#Split data in training (75%) and testing (25%).
+set.seed(123)
+init_sample_ano <- initial_split(df_ano, prop = 3/4, strata = reported)
+train_ano <- training(init_sample_ano)
+test_ano <- testing(init_sample_ano)
+
+rec_ano <- recipe(reported ~ ., data = train_ano) 
+
+trained_rec_ano <- prep(rec_ano, data = train_ano)
+
+```
+
+
+
+```{r, eval=TRUE, echo=FALSE, warning=FALSE, error=FALSE}
+# fit the same linear logistic model as in task 2 of assignment 1, only difference is with one more variable max_anomaly_socre
+glm_model_ano <- logistic_reg() %>% 
+  set_engine("glm") %>% 
+  fit(reported ~ ., data = train_ano)
+
+# Add predictions to test
+test_ano <- test_ano %>%
+  mutate(glm_prob_predictions = predict(glm_model_ano, new_data = test_ano, type = "prob")$.pred_1,# For probabilities
+         glm_class_predictions =  predict(glm_model_ano, new_data = test_ano)$.pred_class)# The predicted class
+
+test_ano %>%
+  yardstick::roc_auc(reported, glm_prob_predictions, event_level = "second")%>%
+  mutate(tag = "glm on test")
+
+# Check results on training set
+train_ano %>%
+  mutate(glm_prob_predictions = predict(glm_model_ano, new_data = train_ano, type = "prob")$.pred_1,
+         glm_class_predictions = predict(glm_model_ano, new_data = train_ano)$.pred_class) %>%
+  yardstick::roc_auc(reported, glm_prob_predictions, event_level = "second")%>%
+  mutate(tag = "glm on train")
+
+# summary
+broom::tidy(glm_model_ano$fit) %>% 
+  mutate_if(is.numeric, ~round(.x, 3)) %>% 
+  DT::datatable(rownames = FALSE)
+
+```
+
+
